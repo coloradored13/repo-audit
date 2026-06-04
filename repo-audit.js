@@ -65,6 +65,19 @@ export const meta = {
 //     cap is hit (fleet-level only — no per-agent ceiling in the API).
 //   - pre-flight hygiene: profiler reports git_status (warns on stale checkout —
 //     we once audited month-old code) + a keep-host-awake note on large repos.
+//
+// CHANGELOG v2.4 — make the rigor reachable under auto/economy fanout (2026-06-04):
+//   v2.1's auto-fanout routes most real repos to BATCHED verify, which bypassed
+//   verifyOne entirely — so v2.2's execution two-gate, v2.3's steelman, and the
+//   tier-asymmetry never ran for the repos that most need them. Fixed:
+//   - verifyMany batched mode is now TWO-STAGE: cheap batched inspection triages
+//     all findings (cost control on the bulk), then scorecard-gating survivors
+//     (batch-confirmed AND (high/critical OR falsifiable-with-execution-on)) are
+//     escalated to verifyOne (execution two-gate + steelman + tier-asymmetry).
+//   - gate-2 (is_genuine_defect/fix_is_sound) — the subtlest call — now runs on
+//     verifierModel for high-severity execution verdicts (was always workerModel)
+//     and the execution prompt steelmans the defect case first. (meta-audit.js
+//     gets the same high-stakes->stronger-model routing for its adjudicator.)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -333,7 +346,7 @@ function reasonVerifyPrompt(f, dimension, reviewerN) {
   return `Adversarially verify this audit finding for the repo at ${ROOT}${reviewerN ? ` (independent reviewer #${reviewerN})` : ''}. First STEELMAN it: state the finding's STRONGEST, most-likely-correct interpretation and the exact conditions under which it IS a real defect — THEN try to refute that strongest form. Read the actual code at the cited location before judging. Do not refute on a shallow or partial reading (e.g. "the library handles it") without checking the specific failure mode the finding claims (e.g. retry-EXHAUSTION, not just retry-exists). Default real=false if you cannot confirm it, or it is already handled.\n\n- REDUCTIVE recommendation (delete/inline/collapse): confirm removal is SAFE — search references; refute if it breaks callers/tests.\n- OPPORTUNITY/improvement: confirm the current state is as described and the payoff is credible; refute churn.\n- ABSENT-control claim: confirm the control truly does not exist anywhere in the repo.\n\nDimension: ${dimension}\nTitle: ${f.title}\nSeverity: ${f.severity}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nGenuine, material, and (if reductive) safe? Confirm or refute with code-grounded reasoning; adjust severity if warranted.`
 }
 function execVerifyPrompt(f, dimension) {
-  return `EXECUTION-GROUNDED verification of a falsifiable finding in the repo at ${ROOT} (dimension: ${dimension}). You are in a sandbox; running code is permitted.\n\nFinding: ${f.title}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nWrite the MINIMAL reproduction that would manifest this issue (a failing test, an exploit PoC, a benchmark, a coverage probe, or fault injection). RUN it from the repo root and capture the REAL output — never invent output.\n\nREPRO-FAITHFULNESS (critical): confirm via coverage/instrumentation that your repro actually EXECUTES the cited file:line. If you cannot confirm it hit the cited code, set hit_cited_line=false and observed=inconclusive — do NOT report not-reproduced for a repro that never reached the code.\n\nGATE 2 (judgment; execution CANNOT settle this): manifesting is necessary but NOT sufficient. A behavior can manifest and still be correct-by-design (correct cooperative cancellation, a documented tradeoff, a defensive/fail-closed default). Set is_genuine_defect=true ONLY if the manifested behavior is actually WRONG, not merely present; set fix_is_sound=false if the recommended fix would regress another property (e.g. catching BaseException swallows KeyboardInterrupt/SystemExit, or breaks a documented guarantee). If manifests-but-correct-by-design, say so in reasoning.\\n\\nReport: reasoning, is_genuine_defect, fix_is_sound, method, repro_code, executed, hit_cited_line, observed (confirmed only on actual manifestation | not-reproduced only if the code ran, hit the line, and the issue did NOT occur | inconclusive otherwise), and the real output.`
+  return `EXECUTION-GROUNDED verification of a falsifiable finding in the repo at ${ROOT} (dimension: ${dimension}). You are in a sandbox; running code is permitted.\n\nFinding: ${f.title}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nWrite the MINIMAL reproduction that would manifest this issue (a failing test, an exploit PoC, a benchmark, a coverage probe, or fault injection). RUN it from the repo root and capture the REAL output — never invent output.\n\nREPRO-FAITHFULNESS (critical): confirm via coverage/instrumentation that your repro actually EXECUTES the cited file:line. If you cannot confirm it hit the cited code, set hit_cited_line=false and observed=inconclusive — do NOT report not-reproduced for a repro that never reached the code.\n\nGATE 2 (judgment; execution CANNOT settle this): manifesting is necessary but NOT sufficient. First STEELMAN it: state the strongest case that the manifested behavior IS a genuine defect, THEN adversarially test whether it is instead correct-by-design. A behavior can manifest and still be correct-by-design (correct cooperative cancellation, a documented tradeoff, a defensive/fail-closed default). Set is_genuine_defect=true ONLY if the manifested behavior is actually WRONG, not merely present; set fix_is_sound=false if the recommended fix would regress another property (e.g. catching BaseException swallows KeyboardInterrupt/SystemExit, or breaks a documented guarantee). If manifests-but-correct-by-design, say so in reasoning.\\n\\nReport: reasoning, is_genuine_defect, fix_is_sound, method, repro_code, executed, hit_cited_line, observed (confirmed only on actual manifestation | not-reproduced only if the code ran, hit the line, and the issue did NOT occur | inconclusive otherwise), and the real output.`
 }
 
 async function reasonVerify(f, dimension, model) {
@@ -350,7 +363,10 @@ async function verifyOne(f, dimension, source) {
   // 1) Execution oracle (runtime is independent of model priors) — only when enabled + falsifiable.
   if (doExecVerify && cls === 'falsifiable') {
     try {
-      const ex = await agent(execVerifyPrompt(f, dimension), { label: `exec:${dimension}:${base(f.file)}`, phase: 'Verify', model: cfg.workerModel, schema: EXEC_VERDICT_SCHEMA })
+      // Gate-2 ("manifests but correct-by-design") is the subtlest call in the verdict, so for
+      // high-severity findings run the whole execution adjudication on the stronger model.
+      const execModel = (sevHigh(f) && cfg.verifierModel !== cfg.workerModel) ? cfg.verifierModel : cfg.workerModel
+      const ex = await agent(execVerifyPrompt(f, dimension), { label: `exec:${dimension}:${base(f.file)}`, phase: 'Verify', model: execModel, schema: EXEC_VERDICT_SCHEMA })
       const rep = ex && ex.reproduction
       if (rep && rep.executed) {
         if (rep.observed === 'confirmed' && rep.hit_cited_line !== false) {
@@ -397,23 +413,36 @@ function batchVerifyPrompt(batch, dimension) {
 }
 async function verifyMany(findings, dimension, source) {
   if (!findings.length) return []
-  if (verifyMode === 'batched') {
-    const batches = chunk(findings, VERIFY_BATCH)
-    const maps = await parallel(batches.map((b, bi) => () =>
-      agent(batchVerifyPrompt(b, dimension), { label: `verify:${dimension}#b${bi + 1}`, phase: 'Verify', model: cfg.workerModel, schema: BATCH_VERDICT_SCHEMA })
-        .then(r => (r?.verdicts || []).reduce((m, v) => { m[v.index] = v; return m }, {}))
-        .catch((e) => { log(`WARN: verify batch ${bi + 1} (${dimension}) failed — findings UNVERIFIED: ${e?.message || e}`); return {} })
+  // per-finding mode: every finding gets the full oracle (execution two-gate / steelman / tier-asymmetry).
+  if (verifyMode !== 'batched') {
+    return await parallel(findings.map(f => () =>
+      verifyOne(f, dimension, source).catch(() => mk(f, dimension, source, unverifiedVerdict('UNVERIFIED — verifier threw; treat as unconfirmed, not refuted')))
     ))
-    return findings.map((f, i) => {
-      const v = (maps[Math.floor(i / VERIFY_BATCH)] || {})[i % VERIFY_BATCH]
-      const verdict = v
-        ? { real: !!v.real, unverified: false, provenance: 'single-model-inspection', reasoning: v.reasoning, votes: 1, real_votes: v.real ? 1 : 0, severity_adjustment: v.severity_adjustment || null }
-        : unverifiedVerdict('UNVERIFIED — no verdict for this finding in batch (failed/missing index); treat as unconfirmed, not refuted')
-      return mk(f, dimension, source, verdict)
-    })
   }
-  return await parallel(findings.map(f => () =>
-    verifyOne(f, dimension, source).catch(() => mk(f, dimension, source, unverifiedVerdict('UNVERIFIED — verifier threw; treat as unconfirmed, not refuted')))
+  // batched mode: TWO-STAGE. Stage A = cheap batched inspection triages ALL findings (cost control
+  // on the bulk). Stage B = escalate the scorecard-gating survivors to verifyOne (execution two-gate
+  // + steelman + tier-asymmetry) so auto/economy fanout does not route real findings AROUND the rigor.
+  const batches = chunk(findings, VERIFY_BATCH)
+  const maps = await parallel(batches.map((b, bi) => () =>
+    agent(batchVerifyPrompt(b, dimension), { label: `verify:${dimension}#b${bi + 1}`, phase: 'Verify', model: cfg.workerModel, schema: BATCH_VERDICT_SCHEMA })
+      .then(r => (r?.verdicts || []).reduce((m, v) => { m[v.index] = v; return m }, {}))
+      .catch((e) => { log(`WARN: verify batch ${bi + 1} (${dimension}) failed — findings UNVERIFIED: ${e?.message || e}`); return {} })
+  ))
+  const triaged = findings.map((f, i) => {
+    const v = (maps[Math.floor(i / VERIFY_BATCH)] || {})[i % VERIFY_BATCH]
+    const verdict = v
+      ? { real: !!v.real, unverified: false, provenance: 'single-model-inspection', reasoning: v.reasoning, votes: 1, real_votes: v.real ? 1 : 0, severity_adjustment: v.severity_adjustment || null }
+      : unverifiedVerdict('UNVERIFIED — no verdict for this finding in batch (failed/missing index); treat as unconfirmed, not refuted')
+    return mk(f, dimension, source, verdict)
+  })
+  // Escalate a batch-CONFIRMED finding when it gates the scorecard: high/critical severity (drives the
+  // verdict), or falsifiable AND execution is enabled (the case the execution oracle can settle). Bulk
+  // low/medium judgment findings keep the cheap batch verdict — that is where the cost savings live.
+  const gates = t => t.verdict?.real && !t.verdict?.unverified && (sevHigh(t) || (t.verify_class === 'falsifiable' && doExecVerify))
+  const nEsc = triaged.filter(gates).length
+  if (nEsc) log(`Verify(${dimension}): batched ${triaged.length}; escalating ${nEsc} scorecard-gating finding(s) to the per-finding oracle.`)
+  return await parallel(triaged.map(t => () =>
+    gates(t) ? verifyOne(t, t.dimension, t.source).catch(() => t) : t
   ))
 }
 

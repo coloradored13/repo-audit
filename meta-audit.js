@@ -213,7 +213,10 @@ const adjudicated = await pipeline(
   (recheck, f) => {
     const falsifiable = f.verify_class === 'falsifiable'
     const prompt = falsifiable ? execAdjudicatePrompt(f, recheck) : reasonAdjudicatePrompt(f, recheck)
-    const model = falsifiable ? workerModel : (isHighStakes(f) ? verifierModel : workerModel)
+    // Route high-stakes findings to the stronger model regardless of class — gate-2 ("manifests but
+    // correct-by-design") is the subtlest call and must not run on the weakest reviewer for a finding
+    // that gates the verdict. (Previously falsifiable always used workerModel.)
+    const model = isHighStakes(f) ? verifierModel : workerModel
     return agent(prompt, { label: `${falsifiable ? 'exec' : 'reason'}:${f.id}`, phase: 'Adjudicate', model, schema: ADJUDICATE_SCHEMA })
       .then(adj => ({ ...f, recheck, adj }))
       .catch(() => ({ ...f, recheck, adj: { method: 'reasoning', final_meta_verdict: 'unverified', overturns_recheck: false, provenance: 'reasoning', reasoning: 'UNVERIFIED — adjudicator threw; treat as unconfirmed, not refuted' } }))
