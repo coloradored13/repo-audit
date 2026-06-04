@@ -58,6 +58,11 @@ const ADJUDICATE_SCHEMA = {
     overturns_recheck: { type: 'boolean', description: 'did the adversarial pass overturn the stage-1 re-check?' },
     provenance: { type: 'string', enum: ['execution-confirmed', 'execution-refuted', 'execution-inconclusive', 'stronger-tier-reasoning', 'reasoning'] },
     severity_final: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'n/a'] },
+    // Two-gate judgment. Manifesting a behavior is necessary but NOT sufficient
+    // to confirm a defect — a behavior can manifest yet be correct-by-design.
+    manifests: { type: 'boolean', description: 'does the claimed behavior actually occur (runtime repro, or code reading if reasoning)?' },
+    is_genuine_defect: { type: 'boolean', description: 'GIVEN it manifests, is it actually WRONG — not correct/intended (e.g. correct cancellation, documented tradeoff, defensive default)?' },
+    fix_is_sound: { type: 'boolean', description: 'would the recommended fix avoid regressing a different correctness property (e.g. not swallow KeyboardInterrupt)?' },
     reproduction: {
       type: 'object',
       properties: {
@@ -169,12 +174,20 @@ Finding id: ${f.id} (cited file: ${f.file}, original severity: ${f.severity})
 Get the full record: \`grep -F '"id": "${f.id}"' ${JSONL}\`.
 A prior independent re-check concluded: meta_verdict=${recheck?.meta_verdict}, claim_holds=${recheck?.claim_holds}, reasoning="${(recheck?.reasoning || '').slice(0, 300)}".
 
-YOUR JOB is adversarial: try to REFUTE both the original audit AND the re-check by experiment.
+YOUR JOB is adversarial, in TWO gates. A finding is CONFIRMED only if it passes BOTH.
+
+GATE 1 — does it MANIFEST? (execution settles this)
 - Write the MINIMAL repro (failing test, exploit PoC, probe, or coverage check) that would manifest the claimed issue, from the repo root.
 - RUN it. Capture the REAL output — never invent output.
 - Confirm via instrumentation/coverage that your repro actually exercised the cited code (hit_cited_line). If it didn't reach the cited code, observed=inconclusive — do NOT report not-reproduced for a repro that never ran the code.
+- Set manifests=true only if the behavior actually occurred at runtime.
 
-Set method='execution'. provenance: execution-confirmed (manifested) | execution-refuted (code ran, hit the line, issue did NOT occur) | execution-inconclusive (couldn't run / didn't reach the line). If you truly cannot execute (tooling/permission blocked), set method='reasoning', provenance='reasoning', and adjudicate by reading the code — say why execution was impossible. final_meta_verdict and overturns_recheck (true if you reached a different verdict than the re-check). Never silent-refute behind a failed repro: inconclusive → unverified, not refuted.`
+GATE 2 — is the manifested behavior a genuine DEFECT? (judgment — execution CANNOT settle this)
+- Manifesting is necessary but NOT sufficient. A behavior can manifest and still be correct-by-design: correct cooperative cancellation, a documented tradeoff, a defensive/fail-closed default. Adversarially argue whether the behavior is actually WRONG versus merely EXISTS.
+- Pressure-test the recommended fix: would applying it regress a different correctness property (e.g. catching BaseException would swallow KeyboardInterrupt/SystemExit; a "fix" that breaks a documented guarantee)? Set fix_is_sound accordingly.
+- Set is_genuine_defect=true only if the manifested behavior is genuinely wrong AND the fix is sound.
+
+VERDICT: final_meta_verdict='confirmed' ONLY if manifests=true AND is_genuine_defect=true. If it manifests but is correct-by-design (is_genuine_defect=false), set final_meta_verdict='refuted', provenance='execution-refuted', reasoning="mechanism real but not a defect — <why intended/correct>". Set method='execution'. provenance otherwise: execution-confirmed (manifests AND genuine defect) | execution-refuted (did not manifest with the line hit, OR manifests-but-correct-by-design) | execution-inconclusive (couldn't run / didn't reach the line). If you truly cannot execute (tooling/permission blocked), set method='reasoning', provenance='reasoning', adjudicate BOTH gates by reading the code, and say why execution was impossible. Set overturns_recheck=true if you reached a different verdict than the re-check. Never silent-refute behind a FAILED repro: execution-inconclusive → unverified, not refuted (distinct from a deliberate correct-by-design refutation).`
 }
 
 function reasonAdjudicatePrompt(f, recheck) {

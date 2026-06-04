@@ -43,6 +43,15 @@ export const meta = {
 //   NOTE (environmental, not engine): long wall-clock on the first validation
 //     run was overnight host SLEEP suspending the process — run awake / on AC /
 //     `caffeinate -dimsu`. Verdict logic itself validated execution-grounded.
+//
+// CHANGELOG v2.2 — two-gate execution verification (2026-06-04):
+//   Execution proves a behavior MANIFESTS; it cannot prove the behavior is a
+//   DEFECT (e.g. CancelledError tearing down siblings reproduces, yet is
+//   correct cooperative cancellation). The execution verifier now runs a second
+//   gate: is_genuine_defect + fix_is_sound. A finding that reproduces but is
+//   correct-by-design is execution-REFUTED ("mechanism real, not a defect"),
+//   not execution-confirmed. Prevents execution-confirmation from rubber-
+//   stamping correct-by-design behavior at the strongest provenance tier.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -165,9 +174,14 @@ const VERDICT_SCHEMA = {
 // Execution-grounded verdict (used only when executeVerification is on, in a sandbox).
 const EXEC_VERDICT_SCHEMA = {
   type: 'object',
-  required: ['reasoning', 'reproduction'],
+  required: ['reasoning', 'reproduction', 'is_genuine_defect'],
   properties: {
     reasoning: { type: 'string' },
+    // Gate 2: manifesting a behavior (reproduction below) is necessary but NOT
+    // sufficient — a behavior can manifest yet be correct-by-design. Execution
+    // settles whether it manifests; this judges whether manifesting is a DEFECT.
+    is_genuine_defect: { type: 'boolean', description: 'GIVEN it manifests, is the behavior actually WRONG — not correct/intended (correct cancellation, documented tradeoff, defensive/fail-closed default)?' },
+    fix_is_sound: { type: 'boolean', description: 'would the recommended fix avoid regressing a different correctness property (e.g. not swallow KeyboardInterrupt)?' },
     reproduction: {
       type: 'object',
       required: ['method', 'executed', 'observed'],
@@ -287,7 +301,7 @@ function reasonVerifyPrompt(f, dimension, reviewerN) {
   return `Adversarially verify this audit finding for the repo at ${ROOT}${reviewerN ? ` (independent reviewer #${reviewerN})` : ''}. REFUTE it if you can. Read the actual code at the cited location before judging. Default real=false if you cannot confirm it, or it is already handled.\n\n- REDUCTIVE recommendation (delete/inline/collapse): confirm removal is SAFE — search references; refute if it breaks callers/tests.\n- OPPORTUNITY/improvement: confirm the current state is as described and the payoff is credible; refute churn.\n- ABSENT-control claim: confirm the control truly does not exist anywhere in the repo.\n\nDimension: ${dimension}\nTitle: ${f.title}\nSeverity: ${f.severity}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nGenuine, material, and (if reductive) safe? Confirm or refute with code-grounded reasoning; adjust severity if warranted.`
 }
 function execVerifyPrompt(f, dimension) {
-  return `EXECUTION-GROUNDED verification of a falsifiable finding in the repo at ${ROOT} (dimension: ${dimension}). You are in a sandbox; running code is permitted.\n\nFinding: ${f.title}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nWrite the MINIMAL reproduction that would manifest this issue (a failing test, an exploit PoC, a benchmark, a coverage probe, or fault injection). RUN it from the repo root and capture the REAL output — never invent output.\n\nREPRO-FAITHFULNESS (critical): confirm via coverage/instrumentation that your repro actually EXECUTES the cited file:line. If you cannot confirm it hit the cited code, set hit_cited_line=false and observed=inconclusive — do NOT report not-reproduced for a repro that never reached the code.\n\nReport: method, repro_code, executed, hit_cited_line, observed (confirmed only on actual manifestation | not-reproduced only if the code ran, hit the line, and the issue did NOT occur | inconclusive otherwise), and the real output.`
+  return `EXECUTION-GROUNDED verification of a falsifiable finding in the repo at ${ROOT} (dimension: ${dimension}). You are in a sandbox; running code is permitted.\n\nFinding: ${f.title}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nWrite the MINIMAL reproduction that would manifest this issue (a failing test, an exploit PoC, a benchmark, a coverage probe, or fault injection). RUN it from the repo root and capture the REAL output — never invent output.\n\nREPRO-FAITHFULNESS (critical): confirm via coverage/instrumentation that your repro actually EXECUTES the cited file:line. If you cannot confirm it hit the cited code, set hit_cited_line=false and observed=inconclusive — do NOT report not-reproduced for a repro that never reached the code.\n\nGATE 2 (judgment; execution CANNOT settle this): manifesting is necessary but NOT sufficient. A behavior can manifest and still be correct-by-design (correct cooperative cancellation, a documented tradeoff, a defensive/fail-closed default). Set is_genuine_defect=true ONLY if the manifested behavior is actually WRONG, not merely present; set fix_is_sound=false if the recommended fix would regress another property (e.g. catching BaseException swallows KeyboardInterrupt/SystemExit, or breaks a documented guarantee). If manifests-but-correct-by-design, say so in reasoning.\\n\\nReport: reasoning, is_genuine_defect, fix_is_sound, method, repro_code, executed, hit_cited_line, observed (confirmed only on actual manifestation | not-reproduced only if the code ran, hit the line, and the issue did NOT occur | inconclusive otherwise), and the real output.`
 }
 
 async function reasonVerify(f, dimension, model) {
@@ -307,8 +321,13 @@ async function verifyOne(f, dimension, source) {
       const ex = await agent(execVerifyPrompt(f, dimension), { label: `exec:${dimension}:${base(f.file)}`, phase: 'Verify', model: cfg.workerModel, schema: EXEC_VERDICT_SCHEMA })
       const rep = ex && ex.reproduction
       if (rep && rep.executed) {
-        if (rep.observed === 'confirmed' && rep.hit_cited_line !== false)
-          return mk(f, dimension, source, { real: true, unverified: false, provenance: 'execution-confirmed', reasoning: ex.reasoning || 'manifested at runtime', votes: 1, real_votes: 1, severity_adjustment: null, reproduction: rep })
+        if (rep.observed === 'confirmed' && rep.hit_cited_line !== false) {
+          // Gate 2: manifesting is not the same as being a defect. A behavior that
+          // reproduces but is correct-by-design (e.g. correct cancellation) is REFUTED.
+          if (ex.is_genuine_defect === false)
+            return mk(f, dimension, source, { real: false, unverified: false, provenance: 'execution-refuted', reasoning: (ex.reasoning || 'manifests but correct-by-design') + ' [reproduced at runtime but judged correct-by-design, not a defect]', votes: 1, real_votes: 0, severity_adjustment: null, reproduction: rep })
+          return mk(f, dimension, source, { real: true, unverified: false, provenance: 'execution-confirmed', reasoning: ex.reasoning || 'reproduced at runtime and judged a genuine defect', votes: 1, real_votes: 1, severity_adjustment: null, reproduction: rep })
+        }
         if (rep.observed === 'not-reproduced' && rep.hit_cited_line === true)
           return mk(f, dimension, source, { real: false, unverified: false, provenance: 'execution-refuted', reasoning: ex.reasoning || 'did not manifest though the cited line ran', votes: 1, real_votes: 0, severity_adjustment: null, reproduction: rep })
         // inconclusive OR not-reproduced-but-line-not-hit => UNVERIFIED (never silent-refute a real bug behind a bad repro)
