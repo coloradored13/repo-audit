@@ -52,14 +52,19 @@ Workflow({ name: "repo-audit", args: { repoRoot: "/abs/path/to/repo" } })
 | `workerModel` | `sonnet` | Finders + falsifiable/cheap verification |
 | `verifierModel` | `opus` | High-severity judgment-finding verification |
 | `trustLevel` | `trusted` | `trusted` runs analyzers/tests; `untrusted` is **inspection only, no code execution** |
-| `executeVerification` | `false` | Execution-grounded verification (writes & runs repro code — **needs a sandbox**) |
+| `executeVerification` | `false` | Execution-grounded verification (writes & runs repro code — **needs a sandbox**). Two-gate: a behavior must both *manifest* and be a *genuine defect* to confirm |
+| `sandboxed` | `false` | Assert the auditor runs in a sandbox/disposable checkout. Turns `executeVerification` on by default (explicit `executeVerification:false` still wins) |
+| `maxOutputTokens` | *(none)* | Fleet-level output-token cap; once hit, not-yet-started passes are skipped so synthesis still runs. Also respects the turn-level budget directive |
 | `hierarchicalSynthesis` | `false` | Per-category sub-synthesis before the meta pass (experimental; for very large audits) |
 
 ### Trust & safety
 
 - **`trustLevel: "untrusted"` is required for any repo you do not trust.** It disables all code execution (no analyzers, no tests, no execution verification) and audits by inspection only.
-- `executeVerification` and `hierarchicalSynthesis` are opt-in and validated only lightly — enable them when you can run the auditor itself containerized.
-- The auditor's finder/recon agents are instructed to observe only and not modify the target repo. This is currently a prompt-level instruction, not a hard gate; run inside a sandbox or a disposable checkout if write-isolation matters to you.
+- `executeVerification` and `hierarchicalSynthesis` are opt-in and validated only lightly — enable them when you can run the auditor itself containerized (or pass `sandboxed:true`).
+- **Read-only enforcement.** Finder/recon agents are *told* to observe only, but that is a prompt-level request — spawned agents still hold Write/Edit. To enforce it at the harness level, wire the PreToolUse hook at [`hooks/readonly-guard.py`](hooks/readonly-guard.py) and set `REPO_AUDIT_GUARD=/abs/path/to/repo-under-audit` for the session running the audit; it blocks any Write/Edit/MultiEdit/NotebookEdit inside the guarded root. No-op when the env var is unset, so it is safe to leave wired. (Per-agent tool denial is not exposed by the workflow API, so the hook is the enforcement point.)
+- **Cost:** `maxOutputTokens` / the turn budget bound *total* spend, but the workflow API exposes no per-agent token ceiling, so a single runaway agent cannot be hard-capped. Prefer `economy`/`auto` fanout for large repos.
+- **Audit current code.** The profiler now reports `git_status`; if the checkout is behind its remote the run warns you (we once audited a month-stale clone and flagged an already-fixed bug). `git fetch`/pull before auditing.
+- **Keep the host awake** for large runs (`caffeinate -dimsu` / on AC) — host sleep suspends the run and balloons wall-clock.
 
 ## Output
 

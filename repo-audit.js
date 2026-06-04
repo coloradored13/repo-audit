@@ -52,6 +52,19 @@ export const meta = {
 //   correct-by-design is execution-REFUTED ("mechanism real, not a defect"),
 //   not execution-confirmed. Prevents execution-confirmation from rubber-
 //   stamping correct-by-design behavior at the strongest provenance tier.
+//
+// CHANGELOG v2.3 — safety, calibration, cost, hygiene (2026-06-04):
+//   - read-only enforcement: hooks/readonly-guard.py (PreToolUse) blocks writes
+//     to the repo under audit when REPO_AUDIT_GUARD is set (the agent() API has
+//     no per-agent tool denial, so enforcement lives in a harness hook).
+//   - sandboxed:true => executeVerification on by default (script can't detect a
+//     sandbox; caller asserts it). Explicit executeVerification:false still wins.
+//   - reasoning verifier now STEELMANS before refuting (caught the READ-297
+//     class: refuting a real bug on a shallow "the library handles it" read).
+//   - maxOutputTokens / turn-budget guard: skips not-yet-started passes once the
+//     cap is hit (fleet-level only — no per-agent ceiling in the API).
+//   - pre-flight hygiene: profiler reports git_status (warns on stale checkout —
+//     we once audited month-old code) + a keep-host-awake note on large repos.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -74,8 +87,14 @@ const cfg = {
   workerModel: A.workerModel || 'sonnet',                               // finders + falsifiable/cheap verify
   verifierModel: A.verifierModel || 'opus',                             // judgment-finding verify (gated by severity)
   trustLevel: A.trustLevel === 'untrusted' ? 'untrusted' : 'trusted',   // untrusted => no code execution at all
-  executeVerification: A.executeVerification === true,                  // execution-grounded verify (needs sandbox)
+  sandboxed: A.sandboxed === true,                                      // caller asserts the auditor runs in a sandbox/disposable checkout
+  // execution-grounded verify. The script cannot detect a sandbox itself, so it
+  // stays opt-in — but asserting sandboxed:true turns it on by default (now safe:
+  // v2.2's gate-2 stops it rubber-stamping correct-by-design behavior). Explicit
+  // executeVerification:false always wins.
+  executeVerification: A.executeVerification === true || (A.executeVerification !== false && A.sandboxed === true && A.trustLevel !== 'untrusted'),
   hierarchicalSynthesis: A.hierarchicalSynthesis === true,              // per-category sub-synthesis (experimental)
+  maxOutputTokens: Number(A.maxOutputTokens) || null,                   // hard cap; also respects the turn-level budget if set
 }
 const runBreadth = cfg.fanout !== 'quick'
 const verifyVotes = cfg.fanout === 'thorough' ? 3 : 1
@@ -83,6 +102,18 @@ const verifyVotes = cfg.fanout === 'thorough' ? 3 : 1
 // Until then it behaves per-finding; the AUTO_BATCH_FILES threshold flips it once we know the file count.
 let verifyMode = cfg.fanout === 'economy' ? 'batched' : 'per-finding'
 const AUTO_BATCH_FILES = 30
+
+// Budget guard (#4). Bounds TOTAL output-token spend: skips not-yet-started passes
+// once the cap is hit so synthesis still runs on what was collected. Respects an
+// explicit maxOutputTokens arg and/or the turn-level budget directive.
+// LIMITATION: agent() exposes no PER-AGENT token ceiling, so a single runaway
+// agent cannot be hard-capped here — this is a fleet-level bound only.
+const _budget = (typeof budget !== 'undefined') ? budget : null
+const tokenCap = cfg.maxOutputTokens || (_budget && _budget.total) || null
+function budgetExceeded() {
+  if (!tokenCap || !_budget || !_budget.spent) return false
+  try { return _budget.spent() >= tokenCap } catch { return false }
+}
 const VERIFY_BATCH = 8
 const canExecute = cfg.trustLevel === 'trusted'                         // GroundTruth tools + execution verify
 const doExecVerify = cfg.executeVerification && canExecute              // execution oracle active?
@@ -125,6 +156,7 @@ const PROFILE_SCHEMA = {
     source_file_count: { type: 'integer', description: 'approximate count of first-party source files (exclude vendored/generated/deps) — used to size the audit' },
     src_dirs: { type: 'array', items: { type: 'string' }, description: 'top-level source dirs analyzers should target (e.g. src, lib)' },
     selected_domain_lenses: { type: 'array', items: { type: 'string' }, description: 'lens keys from the provided menu that genuinely apply to this repo' },
+    git_status: { type: 'string', enum: ['current', 'behind-remote', 'dirty', 'behind-and-dirty', 'not-a-git-repo', 'unknown'], description: 'is the checkout CURRENT? run `git fetch -q` then `git status -sb`/`git rev-list` — behind-remote means you may be auditing stale code' },
   },
 }
 
@@ -298,7 +330,7 @@ function mk(f, dimension, source, verdict) { return { ...f, dimension, source, v
 function unverifiedVerdict(reason, extra) { return { real: false, unverified: true, provenance: 'unverified', reasoning: reason, votes: 0, real_votes: 0, severity_adjustment: null, ...(extra || {}) } }
 
 function reasonVerifyPrompt(f, dimension, reviewerN) {
-  return `Adversarially verify this audit finding for the repo at ${ROOT}${reviewerN ? ` (independent reviewer #${reviewerN})` : ''}. REFUTE it if you can. Read the actual code at the cited location before judging. Default real=false if you cannot confirm it, or it is already handled.\n\n- REDUCTIVE recommendation (delete/inline/collapse): confirm removal is SAFE — search references; refute if it breaks callers/tests.\n- OPPORTUNITY/improvement: confirm the current state is as described and the payoff is credible; refute churn.\n- ABSENT-control claim: confirm the control truly does not exist anywhere in the repo.\n\nDimension: ${dimension}\nTitle: ${f.title}\nSeverity: ${f.severity}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nGenuine, material, and (if reductive) safe? Confirm or refute with code-grounded reasoning; adjust severity if warranted.`
+  return `Adversarially verify this audit finding for the repo at ${ROOT}${reviewerN ? ` (independent reviewer #${reviewerN})` : ''}. First STEELMAN it: state the finding's STRONGEST, most-likely-correct interpretation and the exact conditions under which it IS a real defect — THEN try to refute that strongest form. Read the actual code at the cited location before judging. Do not refute on a shallow or partial reading (e.g. "the library handles it") without checking the specific failure mode the finding claims (e.g. retry-EXHAUSTION, not just retry-exists). Default real=false if you cannot confirm it, or it is already handled.\n\n- REDUCTIVE recommendation (delete/inline/collapse): confirm removal is SAFE — search references; refute if it breaks callers/tests.\n- OPPORTUNITY/improvement: confirm the current state is as described and the payoff is credible; refute churn.\n- ABSENT-control claim: confirm the control truly does not exist anywhere in the repo.\n\nDimension: ${dimension}\nTitle: ${f.title}\nSeverity: ${f.severity}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nGenuine, material, and (if reductive) safe? Confirm or refute with code-grounded reasoning; adjust severity if warranted.`
 }
 function execVerifyPrompt(f, dimension) {
   return `EXECUTION-GROUNDED verification of a falsifiable finding in the repo at ${ROOT} (dimension: ${dimension}). You are in a sandbox; running code is permitted.\n\nFinding: ${f.title}\nLocation: ${f.file}\nEvidence: ${f.evidence}\nRecommendation: ${f.recommendation}\n\nWrite the MINIMAL reproduction that would manifest this issue (a failing test, an exploit PoC, a benchmark, a coverage probe, or fault injection). RUN it from the repo root and capture the REAL output — never invent output.\n\nREPRO-FAITHFULNESS (critical): confirm via coverage/instrumentation that your repro actually EXECUTES the cited file:line. If you cannot confirm it hit the cited code, set hit_cited_line=false and observed=inconclusive — do NOT report not-reproduced for a repro that never reached the code.\n\nGATE 2 (judgment; execution CANNOT settle this): manifesting is necessary but NOT sufficient. A behavior can manifest and still be correct-by-design (correct cooperative cancellation, a documented tradeoff, a defensive/fail-closed default). Set is_genuine_defect=true ONLY if the manifested behavior is actually WRONG, not merely present; set fix_is_sound=false if the recommended fix would regress another property (e.g. catching BaseException swallows KeyboardInterrupt/SystemExit, or breaks a documented guarantee). If manifests-but-correct-by-design, say so in reasoning.\\n\\nReport: reasoning, is_genuine_defect, fix_is_sound, method, repro_code, executed, hit_cited_line, observed (confirmed only on actual manifestation | not-reproduced only if the code ran, hit the line, and the issue did NOT occur | inconclusive otherwise), and the real output.`
@@ -406,7 +438,7 @@ const CLASSIFY_NOTE = `For EACH finding set verify_class: 'falsifiable' if a tes
 // ===========================================================================
 phase('Profile')
 const profile = await withRetry(() => agent(
-  `Profile the software repository at ${ROOT} for an audit. Use shell (ls, find, read the manifest and a few key files) to determine facts — do not guess.\n\nReport: language & build system; test command; KIND (library/CLI/server/MCP-server/web-app/data-pipeline/other); DOMAIN (plain words); 3-6 cohesive SUBSYSTEMS (one-liner + files each); EXTERNAL dependencies; largest source files; SOURCE_FILE_COUNT (approx number of first-party source files — count them with shell, e.g. git ls-files on source dirs; exclude vendored/generated/deps/tests-if-trivial); top-level SOURCE DIRS for analyzers (src_dirs).\n\nFrom this menu of domain-specialist review lenses, SELECT into selected_domain_lenses the keys that GENUINELY apply to this repo (semantic judgment, not keyword match) — choose only those whose expertise is actually relevant; [] if none:\n${LENS_MENU}`,
+  `Profile the software repository at ${ROOT} for an audit. Use shell (ls, find, read the manifest and a few key files) to determine facts — do not guess.\n\nReport: language & build system; test command; KIND (library/CLI/server/MCP-server/web-app/data-pipeline/other); DOMAIN (plain words); 3-6 cohesive SUBSYSTEMS (one-liner + files each); EXTERNAL dependencies; largest source files; SOURCE_FILE_COUNT (approx number of first-party source files — count them with shell, e.g. git ls-files on source dirs; exclude vendored/generated/deps/tests-if-trivial); top-level SOURCE DIRS for analyzers (src_dirs); GIT_STATUS (run `git fetch -q` if a remote exists, then report whether the checkout is current/behind-remote/dirty — behind-remote means the audit may be looking at STALE code).\n\nFrom this menu of domain-specialist review lenses, SELECT into selected_domain_lenses the keys that GENUINELY apply to this repo (semantic judgment, not keyword match) — choose only those whose expertise is actually relevant; [] if none:\n${LENS_MENU}`,
   { label: 'profile-repo', phase: 'Profile', model: cfg.workerModel, schema: PROFILE_SCHEMA }
 ))
 if (!profile) throw new Error('Profile agent returned no result after retries — check repoRoot accessibility and model availability.')
@@ -429,6 +461,11 @@ if (cfg.fanout === 'auto') {
 }
 log(`Profiled: ${profile.language} ${profile.kind} — "${profile.domain}". ${SUBSYSTEMS.length} subsystems, ~${profile.source_file_count ?? '?'} source files. Domain lenses: ${domainKeys.join(', ') || 'none'}. fanout=${cfg.fanout} verify=${verifyMode} trust=${cfg.trustLevel} exec-verify=${doExecVerify} worker=${cfg.workerModel} verifier=${cfg.verifierModel}`)
 if (!canExecute) log(`NOTE: trustLevel=untrusted — GroundTruth tool execution is DISABLED (inspection only). Run the auditor itself in a sandbox if you want execution.`)
+// Pre-flight hygiene (#5): warn on stale checkout (we once audited month-old code) and on sleep risk.
+const gs = profile.git_status
+if (gs === 'behind-remote' || gs === 'behind-and-dirty') log(`⚠ STALE CHECKOUT: ${ROOT} is BEHIND its remote — you may be auditing outdated code. Pull/fetch before trusting findings (a fixed-upstream bug can show as a live finding).`)
+else if (gs === 'dirty') log(`NOTE: working tree is dirty — findings reflect uncommitted local changes.`)
+if ((Number(profile.source_file_count) || 0) > AUTO_BATCH_FILES) log(`NOTE: large repo — this run spawns many agents over a while. Keep the host AWAKE (on AC / lid open / \`caffeinate -dimsu\`); host sleep suspends the run and balloons wall-clock.`)
 
 // ===========================================================================
 // PHASE: Recon
@@ -467,7 +504,8 @@ const framedFindings = await lensPass(
 // ===========================================================================
 let sweepFindings = [], criticFindings = [], bizFindings = [], improveFindings = [], readinessFindings = [], seamFindings = []
 
-if (runBreadth) {
+if (runBreadth && budgetExceeded()) log(`BUDGET: token cap (${tokenCap}) reached after framed audit — skipping breadth passes (sweep/critic/bizlogic/improve/readiness/seam). Synthesis will run on what was collected.`)
+if (runBreadth && !budgetExceeded()) {
   phase('Sweep')
   sweepFindings = await lensPass(
     SUBSYSTEMS, 'Sweep',
@@ -538,7 +576,9 @@ if (runBreadth) {
 // ===========================================================================
 phase('GroundTruth')
 let toolFindings = []
-if (!canExecute) {
+if (canExecute && budgetExceeded()) {
+  log(`GroundTruth SKIPPED: token cap (${tokenCap}) reached. Re-run analyzers manually or raise maxOutputTokens.`)
+} else if (!canExecute) {
   log('GroundTruth SKIPPED: trustLevel=untrusted (no code execution). Add a CI/analyzer-not-run gap manually if needed.')
 } else {
   const langKey = (profile.language || '').toLowerCase()

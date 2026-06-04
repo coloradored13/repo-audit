@@ -236,12 +236,39 @@ const coveredFiles = Object.entries(
 ).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} (${n})`).join(', ')
 const missed = SUBSYSTEMS.length ? (await parallel(SUBSYSTEMS.map(s => () =>
   agent(
-    `Recall check for the original audit of the repo at ${REPO}. Focus on subsystem "${s}". The original audit produced ${FINDINGS.length} findings; your job is to find REAL issues it MISSED ENTIRELY in this subsystem — NOT to re-list or rediscover what it already found.\n\nDEDUP IS MANDATORY. The original findings live in ${JSONL} (one JSON object per line, each with title/file/evidence). Files the audit ALREADY has findings in (with counts): ${coveredFiles || '(none)'}.\nBEFORE reporting any candidate: grep ${JSONL} for the file it lives in (e.g. \`grep -F '"file": ".../<filename>' ${JSONL}\` or grep the filename) and read the existing findings there. If an existing finding already covers the same MECHANISM (even under a different title, severity, or framing), it is NOT a miss — exclude it. Only report issues with no existing counterpart.\n\nRead the subsystem's source files under ${REPO}. Probe negative space: unhandled failure modes, absent controls, cross-module contract gaps, untested error paths, classes of issue a framed audit skips. Each reported miss must be concrete, code-grounded at a file:line, AND confirmed absent from the existing findings. Note why a framed audit plausibly skipped it.`,
+    `Recall check for the original audit of the repo at ${REPO}. Focus on subsystem "${s}". The original audit produced ${FINDINGS.length} findings; your job is to find REAL issues it MISSED ENTIRELY in this subsystem — NOT to re-list or rediscover what it already found.\n\nDEDUP IS MANDATORY. The original findings live in ${JSONL} (one JSON object per line, each with title/file/evidence). Files the audit ALREADY has findings in (with counts): ${coveredFiles || '(none)'}.\nBEFORE reporting any candidate: grep ${JSONL} for the file it lives in (e.g. \`grep -F '"file": ".../<filename>' ${JSONL}\` or grep the filename) and read the existing findings there. If an existing finding already covers the same MECHANISM (even under a different title, severity, or framing), it is NOT a miss — exclude it. Only report issues with no existing counterpart.\n\nRead the subsystem's source files under ${REPO}. Probe negative space: unhandled failure modes, absent controls, cross-module contract gaps, untested error paths, classes of issue a framed audit skips. MATERIALITY BAR (precision over recall): report a miss ONLY if it is confirmed absent from existing findings AND genuinely MATERIAL — would cause a wrong result, a security/safety issue, or a real production failure. EXCLUDE style, nits, theoretical edge cases, and minor observability/logging gaps. If nothing material is missing, return an empty list — a few real misses beat a long list. Each reported miss must be concrete and code-grounded at a file:line. Note why a framed audit plausibly skipped it.`,
     { label: `missed:${s}`, phase: 'Missed', model: workerModel, schema: MISSED_SCHEMA }
   ).then(r => ({ subsystem: s, ...(r || {}) })).catch(() => null)
 ))).filter(Boolean) : []
-const missedCount = missed.reduce((n, m) => n + (m.missed_findings?.length || 0), 0)
+let missedCount = missed.reduce((n, m) => n + (m.missed_findings?.length || 0), 0)
 log(`Recall pass: ${missedCount} candidate missed findings across ${missed.length} subsystems.`)
+
+// Verify the candidates adversarially — otherwise they reach synthesis UNVERIFIED
+// (the least-trustworthy output). Keep only real + novel + material misses.
+const MISSED_VERDICT_SCHEMA = {
+  type: 'object', required: ['is_real', 'is_novel', 'is_material'],
+  properties: {
+    is_real: { type: 'boolean', description: 'is the issue actually present at the cited file:line?' },
+    is_novel: { type: 'boolean', description: 'genuinely NOT covered by any existing finding (grep the JSONL to check)?' },
+    is_material: { type: 'boolean', description: 'wrong-result / security / real production failure (NOT style/nit/theoretical)?' },
+    reasoning: { type: 'string' },
+  },
+}
+if (missedCount) {
+  const flat = []
+  missed.forEach(m => (m.missed_findings || []).forEach(x => flat.push(x)))
+  const verds = await parallel(flat.map(x => () =>
+    agent(
+      `Adversarially verify a candidate "MISSED" finding for the repo at ${REPO}. REFUTE it if you can. Read the cited code, and grep ${JSONL} to confirm no existing finding already covers this mechanism.\n\nTitle: ${x.title}\nFile: ${x.file}\nEvidence: ${(x.evidence || '').slice(0, 400)}\n\nSet is_real (present at the cited location), is_novel (NOT already covered by an existing finding), is_material (causes a wrong result / security / real failure — not style). Default false on anything you cannot concretely confirm.`,
+      { label: `missed-verify:${(x.file || '').split('/').pop()}`, phase: 'Missed', model: workerModel, schema: MISSED_VERDICT_SCHEMA }
+    ).then(v => ({ x, v })).catch(() => ({ x, v: null }))
+  ))
+  const keep = new Set(verds.filter(r => r.v && r.v.is_real && r.v.is_novel && r.v.is_material).map(r => r.x))
+  missed.forEach(m => { m.missed_findings = (m.missed_findings || []).filter(x => keep.has(x)) })
+  const kept = missed.reduce((n, m) => n + m.missed_findings.length, 0)
+  log(`Recall verification: ${kept}/${missedCount} candidate misses survived (real + novel + material); ${missedCount - kept} dropped as noise.`)
+  missedCount = kept
+}
 
 // ---------------------------------------------------------------------------
 // Synthesis
