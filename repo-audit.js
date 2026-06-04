@@ -1,7 +1,7 @@
 export const meta = {
   name: 'repo-audit',
   description: 'Reusable production-readiness audit: profile any repo, run universal + auto-detected domain lenses + executed tools, verify by oracle strength (execution where falsifiable, stronger-tier reasoning where judgment), provenance-weight, and triage into a go/no-go scorecard',
-  whenToUse: 'Point at any repo for a verified, triaged production-readiness scorecard. args:{repoRoot, domainLenses?, fanout?, skipLenses?, workerModel?, verifierModel?, trustLevel?, executeVerification?, hierarchicalSynthesis?}. fanout: quick | economy | standard | thorough. trustLevel: trusted (default; runs analyzers/tests) | untrusted (inspection only, no code execution — REQUIRED for untrusted repos; run the auditor itself in a sandbox if executing). executeVerification + hierarchicalSynthesis are opt-in/experimental (need a sandbox / large-audit validation).',
+  whenToUse: 'Point at any repo for a verified, triaged production-readiness scorecard. args:{repoRoot, domainLenses?, fanout?, skipLenses?, workerModel?, verifierModel?, trustLevel?, executeVerification?, hierarchicalSynthesis?}. fanout: auto (default — picks economy vs standard by repo size) | quick | economy | standard | thorough. trustLevel: trusted (default; runs analyzers/tests) | untrusted (inspection only, no code execution — REQUIRED for untrusted repos; run the auditor itself in a sandbox if executing). executeVerification + hierarchicalSynthesis are opt-in/experimental (need a sandbox / large-audit validation).',
   phases: [
     { title: 'Profile', detail: 'discover language, kind, domain, subsystems, deps, test command, applicable domain lenses' },
     { title: 'Recon', detail: 'deep-map each discovered subsystem' },
@@ -30,6 +30,19 @@ export const meta = {
 //           can run the auditor containerized and confirm behavior.
 //   DEFERRED (cost): cross-model verification — run manually only on the few
 //           RED-gating judgment findings as a final adjudication pass.
+//
+// CHANGELOG v2.1 — calibration + cost, from the hateoas-agent validation +
+// execution-grounded meta-audit (2026-06-04):
+//   - severity recalibration now DEFAULTS DOWN / justifies up (meta-audit found
+//     ~39 findings over-rated vs ~4 under-rated; maintainability/CI/latent =>
+//     capped at medium unless a concrete trigger+blast-radius earns higher).
+//   - fanout defaults to 'auto': profile reports source_file_count; repos over
+//     AUTO_BATCH_FILES (30) use batched verification (~5-8x fewer verifier
+//     agents) to cut cost and rate-limit pressure. Force per-finding with
+//     fanout:'standard'.
+//   NOTE (environmental, not engine): long wall-clock on the first validation
+//     run was overnight host SLEEP suspending the process — run awake / on AC /
+//     `caffeinate -dimsu`. Verdict logic itself validated execution-grounded.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -48,7 +61,7 @@ const cfg = {
   repoRoot: A.repoRoot,
   domainLenses: Array.isArray(A.domainLenses) ? A.domainLenses : [],   // explicit override; [] => profile picks
   skipLenses: Array.isArray(A.skipLenses) ? A.skipLenses : [],
-  fanout: A.fanout || 'standard',                                       // 'quick' | 'economy' | 'standard' | 'thorough'
+  fanout: A.fanout || 'auto',                                           // 'auto' | 'quick' | 'economy' | 'standard' | 'thorough' (auto picks economy vs standard by repo size after profiling)
   workerModel: A.workerModel || 'sonnet',                               // finders + falsifiable/cheap verify
   verifierModel: A.verifierModel || 'opus',                             // judgment-finding verify (gated by severity)
   trustLevel: A.trustLevel === 'untrusted' ? 'untrusted' : 'trusted',   // untrusted => no code execution at all
@@ -57,7 +70,10 @@ const cfg = {
 }
 const runBreadth = cfg.fanout !== 'quick'
 const verifyVotes = cfg.fanout === 'thorough' ? 3 : 1
-const verifyMode = cfg.fanout === 'economy' ? 'batched' : 'per-finding'
+// 'auto' resolves after profiling (large repos => batched verify to control cost/rate-limit pressure).
+// Until then it behaves per-finding; the AUTO_BATCH_FILES threshold flips it once we know the file count.
+let verifyMode = cfg.fanout === 'economy' ? 'batched' : 'per-finding'
+const AUTO_BATCH_FILES = 30
 const VERIFY_BATCH = 8
 const canExecute = cfg.trustLevel === 'trusted'                         // GroundTruth tools + execution verify
 const doExecVerify = cfg.executeVerification && canExecute              // execution oracle active?
@@ -97,6 +113,7 @@ const PROFILE_SCHEMA = {
     },
     external_deps: { type: 'array', items: { type: 'string' } },
     largest_files: { type: 'array', items: { type: 'string' } },
+    source_file_count: { type: 'integer', description: 'approximate count of first-party source files (exclude vendored/generated/deps) — used to size the audit' },
     src_dirs: { type: 'array', items: { type: 'string' }, description: 'top-level source dirs analyzers should target (e.g. src, lib)' },
     selected_domain_lenses: { type: 'array', items: { type: 'string' }, description: 'lens keys from the provided menu that genuinely apply to this repo' },
   },
@@ -370,7 +387,7 @@ const CLASSIFY_NOTE = `For EACH finding set verify_class: 'falsifiable' if a tes
 // ===========================================================================
 phase('Profile')
 const profile = await withRetry(() => agent(
-  `Profile the software repository at ${ROOT} for an audit. Use shell (ls, find, read the manifest and a few key files) to determine facts — do not guess.\n\nReport: language & build system; test command; KIND (library/CLI/server/MCP-server/web-app/data-pipeline/other); DOMAIN (plain words); 3-6 cohesive SUBSYSTEMS (one-liner + files each); EXTERNAL dependencies; largest source files; top-level SOURCE DIRS for analyzers (src_dirs).\n\nFrom this menu of domain-specialist review lenses, SELECT into selected_domain_lenses the keys that GENUINELY apply to this repo (semantic judgment, not keyword match) — choose only those whose expertise is actually relevant; [] if none:\n${LENS_MENU}`,
+  `Profile the software repository at ${ROOT} for an audit. Use shell (ls, find, read the manifest and a few key files) to determine facts — do not guess.\n\nReport: language & build system; test command; KIND (library/CLI/server/MCP-server/web-app/data-pipeline/other); DOMAIN (plain words); 3-6 cohesive SUBSYSTEMS (one-liner + files each); EXTERNAL dependencies; largest source files; SOURCE_FILE_COUNT (approx number of first-party source files — count them with shell, e.g. git ls-files on source dirs; exclude vendored/generated/deps/tests-if-trivial); top-level SOURCE DIRS for analyzers (src_dirs).\n\nFrom this menu of domain-specialist review lenses, SELECT into selected_domain_lenses the keys that GENUINELY apply to this repo (semantic judgment, not keyword match) — choose only those whose expertise is actually relevant; [] if none:\n${LENS_MENU}`,
   { label: 'profile-repo', phase: 'Profile', model: cfg.workerModel, schema: PROFILE_SCHEMA }
 ))
 if (!profile) throw new Error('Profile agent returned no result after retries — check repoRoot accessibility and model availability.')
@@ -380,7 +397,18 @@ const largest = (profile.largest_files || []).join(', ') || 'n/a'
 const picked = cfg.domainLenses.length ? cfg.domainLenses
   : (Array.isArray(profile.selected_domain_lenses) && profile.selected_domain_lenses.length ? profile.selected_domain_lenses : autoDetectDomainLenses(profile))
 const domainKeys = picked.filter(k => DOMAIN_LENS_LIB[k])
-log(`Profiled: ${profile.language} ${profile.kind} — "${profile.domain}". ${SUBSYSTEMS.length} subsystems. Domain lenses: ${domainKeys.join(', ') || 'none'}. fanout=${cfg.fanout} verify=${verifyMode} trust=${cfg.trustLevel} exec-verify=${doExecVerify} worker=${cfg.workerModel} verifier=${cfg.verifierModel}`)
+// Resolve 'auto' fanout now that we know the repo size: large repos => batched verification,
+// which is ~5-8x fewer verifier agents (cost + rate-limit pressure) at a modest precision cost.
+if (cfg.fanout === 'auto') {
+  const fcount = Number(profile.source_file_count) || 0
+  if (fcount > AUTO_BATCH_FILES) {
+    verifyMode = 'batched'
+    log(`auto-fanout: ~${fcount} source files (> ${AUTO_BATCH_FILES}) → batched verification to control cost & rate-limit pressure. Override with fanout:"standard" for per-finding verification.`)
+  } else {
+    log(`auto-fanout: ~${fcount || 'unknown'} source files (≤ ${AUTO_BATCH_FILES}) → per-finding verification.`)
+  }
+}
+log(`Profiled: ${profile.language} ${profile.kind} — "${profile.domain}". ${SUBSYSTEMS.length} subsystems, ~${profile.source_file_count ?? '?'} source files. Domain lenses: ${domainKeys.join(', ') || 'none'}. fanout=${cfg.fanout} verify=${verifyMode} trust=${cfg.trustLevel} exec-verify=${doExecVerify} worker=${cfg.workerModel} verifier=${cfg.verifierModel}`)
 if (!canExecute) log(`NOTE: trustLevel=untrusted — GroundTruth tool execution is DISABLED (inspection only). Run the auditor itself in a sandbox if you want execution.`)
 
 // ===========================================================================
@@ -536,7 +564,7 @@ const lineFor = (f, i) =>
   `title: ${f.title}\nfile: ${f.file}\nevidence: ${(f.evidence || '').slice(0, 400)}\nrecommendation: ${(f.recommendation || '').slice(0, 300)}\nverifier: ${(f.verdict?.reasoning || 'n/a').slice(0, 200)}` +
   (f.verdict?.severity_adjustment ? `\nseverity_note: ${f.verdict.severity_adjustment}` : '')
 
-const RECALIBRATE = `SEVERITY RECALIBRATION (do this FIRST, before ranking): each finder used its own bar, so re-score every finding's severity against ONE rubric — critical: exploitable/data-corrupting in normal use; high: exploitable under attacker control OR wrong-result under realistic input; medium: latent risk or material maintainability cost; low: style/polish. Use the recalibrated severity in triage and ranking.`
+const RECALIBRATE = `SEVERITY RECALIBRATION (do this FIRST, before ranking): each finder used its own bar AND finders systematically OVER-rate — so re-score every finding against ONE rubric, biased toward DOWN-grading. Rubric — critical: exploitable/data-corrupting in NORMAL use, no attacker needed; high: wrong-result under realistic input OR exploitable under attacker control, reachable on a real code path; medium: latent risk, or material maintainability/observability cost; low: style/polish/defensive-nit. DEFAULT DOWN, JUSTIFY UP: assign the LOWER severity unless you can name the concrete trigger and blast radius that earns the higher one. Specifically demote: maintainability/duplication/observability/logging findings are at most MEDIUM (never high) unless they cause a wrong result; "missing CI/lockfile/type-check" supply-chain gaps are MEDIUM unless they ship a known-exploitable artifact; latent bugs unreachable under default config are at most MEDIUM. A finding is only critical/high if a reader could write the failing input or exploit from your evidence. Use the recalibrated severity in triage and ranking.`
 const PROVENANCE_RULE = `PROVENANCE WEIGHTING: trust order is execution-confirmed > tool-reported > stronger-tier-agreed > single-model-inspection > unverified. An execution-confirmed or tool-reported critical may be a hard RED. A critical that is only single-model-inspection or judgment-class gets verdict NEEDS-HUMAN (not auto-RED). UNVERIFIED findings are unconfirmed (needs human check), NOT refuted — say so in their triage rationale.`
 const ranSources = Object.entries(bySource).filter(([, n]) => n > 0).map(([k, n]) => `${k}(${n})`).join(', ')
 

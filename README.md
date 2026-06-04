@@ -46,7 +46,7 @@ Workflow({ name: "repo-audit", args: { repoRoot: "/abs/path/to/repo" } })
 | Arg | Default | Meaning |
 |---|---|---|
 | `repoRoot` | *(required)* | Absolute path to the repo to audit |
-| `fanout` | `standard` | `quick` (framed only) · `economy` (batched cheap verify) · `standard` · `thorough` (3-vote verification) |
+| `fanout` | `auto` | `auto` (picks economy vs standard by repo size — repos > 30 source files use batched verification to control cost) · `quick` (framed only) · `economy` (batched cheap verify) · `standard` (per-finding verify) · `thorough` (3-vote verification) |
 | `domainLenses` | *(auto)* | Explicit lens keys to force; otherwise the profiler picks |
 | `skipLenses` | `[]` | Lens/dimension keys to skip |
 | `workerModel` | `sonnet` | Finders + falsifiable/cheap verification |
@@ -70,6 +70,25 @@ The workflow returns a structured object:
 - `by_source` — finding counts per pass
 - `plan` — executive summary, **scorecard** (one row per category with verdict + bar-to-clear + blocking IDs), full **triage** (every finding, merged & dispositioned), **prioritized_actions** (defects), **opportunities** (improvements, ranked separately), **quick_wins**, **themes**
 - `all_findings` — every finding with verdict, provenance, verifier reasoning, and any reproduction
+
+## Operational notes
+
+- **Keep the host awake.** Each subagent is a process; if the machine sleeps mid-run (closed lid on battery, idle sleep), the whole audit suspends and wall-clock balloons. Run on AC with the lid open, or hold it awake with `caffeinate -dimsu` (macOS). This is the single biggest determinant of how long a run takes.
+- **Cost scales with fan-out.** `auto` keeps larger repos on batched verification for this reason. For a paid/API deployment, prefer `economy`, and treat a full `standard`/`thorough` run on a large repo as a deliberate (expensive) choice.
+
+## meta-audit — auditing the audit
+
+[`meta-audit.js`](meta-audit.js) is a companion workflow that grades a `repo-audit` result. For each finding it independently re-derives the claim from the real code, then **adversarially verifies by oracle**: falsifiable findings are settled by *writing and running a repro* (execution-confirmed / -refuted), judgment findings by stronger-tier adversarial reasoning. It adds a per-subsystem recall pass for findings the audit missed, then grades the original audit **A–F** with false-positive / false-negative / severity-correction lists.
+
+```
+Workflow({ scriptPath: ".../meta-audit.js", args: {
+  repo: "/abs/path/to/repo",
+  inputJsonl: "findings.jsonl",   // one finding per line (from a repo-audit all_findings dump)
+  indexPath:  "index.json"         // { repo, subsystems, index:[{id,severity,verdict,verify_class,file,blocking}] }
+}})
+```
+
+Use it to establish trust in an audit (it execution-confirmed this engine's flagship findings) — but note its recall pass is only as good as its dedup against the original findings.
 
 ## License
 

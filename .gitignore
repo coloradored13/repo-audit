@@ -9,3 +9,10 @@
 # Local audit output (if you redirect results to files)
 out/
 *.audit.json
+
+# Meta-audit working data
+.meta-audit-*.json
+.meta-audit-*.jsonl
+
+# stray analyzer artifacts
+.coverage
