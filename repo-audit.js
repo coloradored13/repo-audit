@@ -1,7 +1,7 @@
 export const meta = {
   name: 'repo-audit',
   description: 'Reusable production-readiness audit: profile any repo, run universal + auto-detected domain lenses + executed tools, verify by oracle strength (execution where falsifiable, stronger-tier reasoning where judgment), provenance-weight, and triage into a go/no-go scorecard',
-  whenToUse: 'Point at any repo for a verified, triaged production-readiness scorecard. args:{repoRoot, domainLenses?, fanout?, skipLenses?, workerModel?, verifierModel?, trustLevel?, executeVerification?, hierarchicalSynthesis?}. fanout: auto (default — picks economy vs standard by repo size) | quick | economy | standard | thorough. trustLevel: trusted (default; runs analyzers/tests) | untrusted (inspection only, no code execution — REQUIRED for untrusted repos; run the auditor itself in a sandbox if executing). executeVerification + hierarchicalSynthesis are opt-in/experimental (need a sandbox / large-audit validation).',
+  whenToUse: 'Point at any repo for a verified, triaged production-readiness scorecard. args:{repoRoot, domainLenses?, fanout?, skipLenses?, workerModel?, verifierModel?, trustLevel?, executeVerification?, hierarchicalSynthesis?}. fanout: auto (default — picks economy vs standard by repo size) | quick | economy | standard | thorough. trustLevel: trusted (default; runs analyzers/tests) | untrusted (inspection only, no code execution — REQUIRED for untrusted repos; run the auditor itself in a sandbox if executing). executeVerification (per-finding execution oracle) is now ON by default for trusted runs — pass executeVerification:false to disable, or trustLevel:untrusted to forbid all execution. hierarchicalSynthesis stays opt-in/experimental (large-audit validation).',
   phases: [
     { title: 'Profile', detail: 'discover language, kind, domain, subsystems, deps, test command, applicable domain lenses' },
     { title: 'Recon', detail: 'deep-map each discovered subsystem' },
@@ -78,6 +78,16 @@ export const meta = {
 //     verifierModel for high-severity execution verdicts (was always workerModel)
 //     and the execution prompt steelmans the defect case first. (meta-audit.js
 //     gets the same high-stakes->stronger-model routing for its adjudicator.)
+//
+// CHANGELOG v2.5 — execution oracle on by default for trusted runs (2026-06-05):
+//   executeVerification was opt-in (required executeVerification:true or a
+//   sandboxed:true assertion), so trusted audits silently shipped falsifiable
+//   findings as inspection-grade — a 311-finding sigma-mem run had 0 of 229
+//   falsifiable findings runtime-verified, yet synthesis still labeled some
+//   "execution-confirmed" (provenance inflation). Now ON by default whenever
+//   trustLevel=trusted. trustLevel:untrusted still forbids all execution and an
+//   explicit executeVerification:false still wins; the sandboxed flag is no
+//   longer required to enable it.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -101,11 +111,14 @@ const cfg = {
   verifierModel: A.verifierModel || 'opus',                             // judgment-finding verify (gated by severity)
   trustLevel: A.trustLevel === 'untrusted' ? 'untrusted' : 'trusted',   // untrusted => no code execution at all
   sandboxed: A.sandboxed === true,                                      // caller asserts the auditor runs in a sandbox/disposable checkout
-  // execution-grounded verify. The script cannot detect a sandbox itself, so it
-  // stays opt-in — but asserting sandboxed:true turns it on by default (now safe:
-  // v2.2's gate-2 stops it rubber-stamping correct-by-design behavior). Explicit
-  // executeVerification:false always wins.
-  executeVerification: A.executeVerification === true || (A.executeVerification !== false && A.sandboxed === true && A.trustLevel !== 'untrusted'),
+  // execution-grounded verify. DEFAULT ON for trusted runs (v2.5): trustLevel
+  // already means "I trust this code to run" — GroundTruth analyzers/tests execute
+  // under it — so routing falsifiable findings through a repro is a consistent
+  // extension, and v2.2's gate-2 stops it rubber-stamping correct-by-design
+  // behavior. Two contracts still hold: trustLevel:untrusted NEVER executes, and
+  // an explicit executeVerification:false always wins. (sandboxed: still accepted
+  // as a hint but no longer required to turn this on.)
+  executeVerification: A.executeVerification !== false && A.trustLevel !== 'untrusted',
   hierarchicalSynthesis: A.hierarchicalSynthesis === true,              // per-category sub-synthesis (experimental)
   maxOutputTokens: Number(A.maxOutputTokens) || null,                   // hard cap; also respects the turn-level budget if set
 }
