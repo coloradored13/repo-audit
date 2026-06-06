@@ -95,8 +95,28 @@ export const meta = {
 // ---------------------------------------------------------------------------
 let A = args
 if (typeof A === 'string') {
-  try { const parsed = JSON.parse(A); A = (parsed && typeof parsed === 'object') ? parsed : { repoRoot: A } }
-  catch { A = { repoRoot: A } }
+  const s = A.trim()
+  try {
+    const parsed = JSON.parse(s)
+    A = (parsed && typeof parsed === 'object') ? parsed : { repoRoot: s }
+  } catch {
+    // Accept the documented "key=value key=value" string form so script-level
+    // knobs (fanout/trustLevel/executeVerification) actually apply instead of the
+    // whole string silently collapsing into repoRoot and every flag defaulting.
+    // A bare path (no '=') stays repoRoot; exact true/false tokens coerce to bool.
+    if (s.includes('=')) {
+      A = {}
+      for (const tok of s.split(/\s+/)) {
+        const i = tok.indexOf('=')
+        if (i === -1) continue
+        const k = tok.slice(0, i)
+        const v = tok.slice(i + 1)
+        A[k] = v === 'true' ? true : v === 'false' ? false : v
+      }
+    } else {
+      A = { repoRoot: s }
+    }
+  }
 }
 A = A || {}
 if (!A.repoRoot) {
