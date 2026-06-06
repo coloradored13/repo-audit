@@ -139,7 +139,11 @@ const INDEX_SCHEMA = {
 phase('Bootstrap')
 const idx = await withRetry(() => agent(
   `Read the JSON file ${A.indexPath}. It has keys: repo, subsystems (array of strings), and index (an array of finding objects, each with id/severity/verdict/verify_class/blocking). Return ALL of the index array as "findings" and the subsystems array as "subsystems". Include every finding — do not sample or truncate.`,
-  { label: 'bootstrap-index', phase: 'Bootstrap', model: workerModel, schema: INDEX_SCHEMA }
+  // Pinned to verifierModel (not workerModel): this is a single high-value call that
+  // must return the ENTIRE index in one structured response. A small/cheap workerModel
+  // (e.g. haiku) risks truncating a large index, silently shrinking the whole audit.
+  // Cost is negligible (1 call); correctness of every downstream stage depends on it.
+  { label: 'bootstrap-index', phase: 'Bootstrap', model: verifierModel, schema: INDEX_SCHEMA }
 ))
 const FINDINGS = idx.findings || []
 const SUBSYSTEMS = A.subsystems || idx.subsystems || []
